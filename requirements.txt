@@ -1,5 +1,4 @@
-@"
-pandas
+﻿pandas
 numpy
 matplotlib
 seaborn
@@ -15,4 +14,3 @@ flake8
 jupyter
 xverse
 woe
-"@ | Out-File -FilePath requirements.txt -Encoding utf8
