@@ -1,22 +1,24 @@
 import pandas as pd
-import numpy as np
 from sklearn.pipeline import Pipeline
 from sklearn.base import BaseEstimator, TransformerMixin
-from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
-from sklearn.cluster import KMeans
 import warnings
+
 warnings.filterwarnings('ignore')
 
 RANDOM_STATE = 42
 
+
 class FeatureEngineer(BaseEstimator, TransformerMixin):
     """
-    Aggregates per customer: total, avg, std, count of amounts,
-    mode of ProductCategory and ChannelId, average time features.
+    Aggregates per customer and one-hot encodes categorical mode columns.
+    Returns only numeric features.
     """
+
     def fit(self, X, y=None):
         return self
+
     def transform(self, X):
         df = X.copy()
         df['TransactionStartTime'] = pd.to_datetime(df['TransactionStartTime'])
@@ -33,8 +35,14 @@ class FeatureEngineer(BaseEstimator, TransformerMixin):
         ).reset_index()
 
         mode_agg = df.groupby('CustomerId').agg(
-            mode_product_category=('ProductCategory', lambda x: x.mode().iloc[0] if not x.mode().empty else 'Unknown'),
-            mode_channel_id=('ChannelId', lambda x: x.mode().iloc[0] if not x.mode().empty else 'Unknown')
+            mode_product_category=(
+                'ProductCategory',
+                lambda x: x.mode().iloc[0] if not x.mode().empty else 'Unknown'
+            ),
+            mode_channel_id=(
+                'ChannelId',
+                lambda x: x.mode().iloc[0] if not x.mode().empty else 'Unknown'
+            )
         ).reset_index()
 
         time_agg = df.groupby('CustomerId').agg(
@@ -45,93 +53,95 @@ class FeatureEngineer(BaseEstimator, TransformerMixin):
         ).reset_index()
 
         profile = num_agg.merge(mode_agg, on='CustomerId').merge(time_agg, on='CustomerId')
-        # Keep CustomerId temporarily for merging target
-        return profile  # Returns DataFrame with CustomerId
+        profile = pd.get_dummies(
+            profile,
+            columns=['mode_product_category', 'mode_channel_id'],
+            drop_first=True
+        )
+        return profile
 
-def compute_rfm_and_target(df_raw, snapshot_date=None):
+
+def compute_rfm_and_target(df_raw, snapshot_date=None, high_risk_percentile=20):
     """
-    df_raw: raw transaction DataFrame with TransactionStartTime, CustomerId, Amount
-    Returns: DataFrame with CustomerId, recency, frequency, monetary, is_high_risk
+    Returns DataFrame with CustomerId, is_high_risk.
+    Uses RFM scoring: high recency, low frequency, low monetary = high risk.
+    Top high_risk_percentile% of customers by composite risk score are labeled 1.
     """
     df = df_raw.copy()
     df['TransactionStartTime'] = pd.to_datetime(df['TransactionStartTime'])
     if snapshot_date is None:
         snapshot_date = df['TransactionStartTime'].max() + pd.Timedelta(days=1)
-    
+
     rfm = df.groupby('CustomerId').agg(
         recency=('TransactionStartTime', lambda x: (snapshot_date - x.max()).days),
         frequency=('TransactionId', 'nunique'),
         monetary=('Amount', 'sum')
     ).reset_index()
 
-    # Scale for clustering
-    scaler = StandardScaler()
-    rfm_scaled = scaler.fit_transform(rfm[['recency', 'frequency', 'monetary']])
+    r_min, r_max = rfm['recency'].min(), rfm['recency'].max()
+    f_min, f_max = rfm['frequency'].min(), rfm['frequency'].max()
+    m_min, m_max = rfm['monetary'].min(), rfm['monetary'].max()
 
-    # K-Means with 3 clusters
-    kmeans = KMeans(n_clusters=3, random_state=RANDOM_STATE)
-    rfm['cluster'] = kmeans.fit_predict(rfm_scaled)
+    rfm['r_score'] = (rfm['recency'] - r_min) / (r_max - r_min + 1e-10)
+    rfm['f_score'] = 1 - (rfm['frequency'] - f_min) / (f_max - f_min + 1e-10)
+    rfm['m_score'] = 1 - (rfm['monetary'] - m_min) / (m_max - m_min + 1e-10)
+    rfm['risk_score'] = (rfm['r_score'] + rfm['f_score'] + rfm['m_score']) / 3
 
-    # Identify high‑risk cluster: lowest average monetary and frequency
-    cluster_stats = rfm.groupby('cluster')[['monetary', 'frequency']].mean()
-    # The cluster with the smallest sum of normalized scores is the high‑risk
-    cluster_stats['score'] = cluster_stats['monetary'] + cluster_stats['frequency']
-    high_risk_cluster = cluster_stats['score'].idxmin()
-    
-    rfm['is_high_risk'] = (rfm['cluster'] == high_risk_cluster).astype(int)
+    threshold = rfm['risk_score'].quantile(1 - high_risk_percentile / 100)
+    rfm['is_high_risk'] = (rfm['risk_score'] >= threshold).astype(int)
+
+    print("\nRFM Target Distribution:")
+    print(rfm['is_high_risk'].value_counts())
+    print(f"High-risk rate: {rfm['is_high_risk'].mean():.2%}")
+
     return rfm[['CustomerId', 'is_high_risk']]
 
+
+def load_raw_data(path='data/raw/data.csv'):
+    return pd.read_csv(path)
+
+
 def build_preprocessing_pipeline():
-    pipeline = Pipeline(steps=[
-        ('feature_engineer', FeatureEngineer()),
+    """
+    Pipeline for final imputation and scaling.
+    Feature engineering is done separately to preserve column names.
+    """
+    return Pipeline(steps=[
         ('imputer', SimpleImputer(strategy='median')),
         ('scaler', StandardScaler())
     ])
-    return pipeline
 
-def process_and_save(raw_path='data/raw/Xente.csv',
+
+def process_and_save(raw_path='data/raw/data.csv',
                      output_features='data/processed/features.csv',
                      output_target='data/processed/target.csv',
                      output_final='data/processed/model_data.csv'):
     df = load_raw_data(raw_path)
-    
-    # Compute target
+
     target_df = compute_rfm_and_target(df)
     target_df.to_csv(output_target, index=False)
-    
-    # Compute features
+    print(f"Target saved to {output_target}")
+
+    engineer = FeatureEngineer()
+    profile = engineer.fit_transform(df)
+
+    customer_ids = profile['CustomerId']
+    X = profile.drop(columns=['CustomerId'])
+    feature_columns = X.columns.tolist()
+
     pipeline = build_preprocessing_pipeline()
-    X_with_cust = pipeline.named_steps['feature_engineer'].fit_transform(df)
-    # Remove CustomerId before imputation/scaling
-    customer_ids = X_with_cust['CustomerId']
-    X_numeric = X_with_cust.drop(columns=['CustomerId'])
-    
-    # Apply imputer and scaler manually (since pipeline expects full array)
-    # Actually, we can adjust pipeline to work with DataFrame, but easier:
-    # We'll build a new pipeline without the FeatureEngineer for final steps
-    # Better: we'll modify the pipeline to keep CustomerId aside
-    # Here we'll just do it stepwise for clarity
-    imputer = SimpleImputer(strategy='median')
-    scaler = StandardScaler()
-    X_imputed = imputer.fit_transform(X_numeric)
-    X_scaled = scaler.fit_transform(X_imputed)
-    
-    # Convert back to DataFrame with column names
-    feature_names = X_numeric.columns.tolist()
-    X_processed = pd.DataFrame(X_scaled, columns=feature_names)
-    X_processed.insert(0, 'CustomerId', customer_ids)
-    
-    # Save features
-    X_processed.to_csv(output_features, index=False)
-    
-    # Merge with target
-    final_df = X_processed.merge(target_df, on='CustomerId', how='inner')
+    X_processed = pipeline.fit_transform(X)
+
+    X_final = pd.DataFrame(X_processed, columns=feature_columns)
+    X_final.insert(0, 'CustomerId', customer_ids)
+    X_final.to_csv(output_features, index=False)
+    print(f"Features saved to {output_features}")
+
+    final_df = X_final.merge(target_df, on='CustomerId', how='inner')
     final_df.to_csv(output_final, index=False)
-    print(f"Final dataset with target saved to {output_final}")
+    print(f"Final model dataset saved to {output_final}")
     return final_df
 
-def load_raw_data(path='data/raw/Xente.csv'):
-    return pd.read_csv(path)
 
 if __name__ == '__main__':
     process_and_save()

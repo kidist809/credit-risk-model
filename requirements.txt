@@ -1,4 +1,4 @@
-﻿pandas
+pandas
 numpy
 matplotlib
 seaborn
@@ -7,10 +7,12 @@ xgboost
 lightgbm
 mlflow
 fastapi
-uvicorn
+uvicorn[standard]
 pydantic
 pytest
 flake8
+black
 jupyter
 xverse
 woe
+requests
