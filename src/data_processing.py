@@ -2,8 +2,9 @@ import pandas as pd
 import numpy as np
 from sklearn.pipeline import Pipeline
 from sklearn.base import BaseEstimator, TransformerMixin
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.impute import SimpleImputer
+from sklearn.cluster import KMeans
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -11,25 +12,19 @@ RANDOM_STATE = 42
 
 class FeatureEngineer(BaseEstimator, TransformerMixin):
     """
-    Master transformer that performs:
-    - Aggregation (Total, Avg, Std, Count)
-    - Mode of categoricals per customer
-    - Time feature extraction (hour, day, month, year)
-    - One‑hot encoding of categoricals
-    - Imputation & scaling handled later in pipeline
+    Aggregates per customer: total, avg, std, count of amounts,
+    mode of ProductCategory and ChannelId, average time features.
     """
-    def __init__(self):
-        pass
-
     def fit(self, X, y=None):
         return self
-
     def transform(self, X):
         df = X.copy()
-        # Convert to datetime
         df['TransactionStartTime'] = pd.to_datetime(df['TransactionStartTime'])
+        df['hour'] = df['TransactionStartTime'].dt.hour
+        df['day'] = df['TransactionStartTime'].dt.day
+        df['month'] = df['TransactionStartTime'].dt.month
+        df['year'] = df['TransactionStartTime'].dt.year
 
-        # 1. Numeric aggregations per CustomerId
         num_agg = df.groupby('CustomerId').agg(
             total_amount=('Amount', 'sum'),
             avg_amount=('Amount', 'mean'),
@@ -37,50 +32,56 @@ class FeatureEngineer(BaseEstimator, TransformerMixin):
             transaction_count=('TransactionId', 'count')
         ).reset_index()
 
-        # 2. Most frequent ProductCategory and ChannelId per customer
         mode_agg = df.groupby('CustomerId').agg(
             mode_product_category=('ProductCategory', lambda x: x.mode().iloc[0] if not x.mode().empty else 'Unknown'),
             mode_channel_id=('ChannelId', lambda x: x.mode().iloc[0] if not x.mode().empty else 'Unknown')
         ).reset_index()
 
-        # 3. Time features: take the latest transaction's time values?
-        # For simplicity, use the average transaction hour/day/month/year per customer.
-        time_df = df.groupby('CustomerId').agg(
+        time_agg = df.groupby('CustomerId').agg(
             avg_hour=('hour', 'mean'),
             avg_day=('day', 'mean'),
             avg_month=('month', 'mean'),
             avg_year=('year', 'mean')
         ).reset_index()
 
-        # Merge all aggregations
-        customer_profile = num_agg.merge(mode_agg, on='CustomerId').merge(time_df, on='CustomerId')
+        profile = num_agg.merge(mode_agg, on='CustomerId').merge(time_agg, on='CustomerId')
+        # Keep CustomerId temporarily for merging target
+        return profile  # Returns DataFrame with CustomerId
 
-        # Drop CustomerId for modeling
-        customer_profile.drop(columns=['CustomerId'], inplace=True)
-
-        # One‑hot encode categoricals
-        cat_cols = ['mode_product_category', 'mode_channel_id']
-        customer_profile = pd.get_dummies(customer_profile, columns=cat_cols, drop_first=True)
-
-        return customer_profile
-
-def load_raw_data(path='data/raw/Xente.csv'):
-    df = pd.read_csv(path)
-    # Create time columns if not already (needed for aggregation)
+def compute_rfm_and_target(df_raw, snapshot_date=None):
+    """
+    df_raw: raw transaction DataFrame with TransactionStartTime, CustomerId, Amount
+    Returns: DataFrame with CustomerId, recency, frequency, monetary, is_high_risk
+    """
+    df = df_raw.copy()
     df['TransactionStartTime'] = pd.to_datetime(df['TransactionStartTime'])
-    df['hour'] = df['TransactionStartTime'].dt.hour
-    df['day'] = df['TransactionStartTime'].dt.day
-    df['month'] = df['TransactionStartTime'].dt.month
-    df['year'] = df['TransactionStartTime'].dt.year
-    return df
+    if snapshot_date is None:
+        snapshot_date = df['TransactionStartTime'].max() + pd.Timedelta(days=1)
+    
+    rfm = df.groupby('CustomerId').agg(
+        recency=('TransactionStartTime', lambda x: (snapshot_date - x.max()).days),
+        frequency=('TransactionId', 'nunique'),
+        monetary=('Amount', 'sum')
+    ).reset_index()
+
+    # Scale for clustering
+    scaler = StandardScaler()
+    rfm_scaled = scaler.fit_transform(rfm[['recency', 'frequency', 'monetary']])
+
+    # K-Means with 3 clusters
+    kmeans = KMeans(n_clusters=3, random_state=RANDOM_STATE)
+    rfm['cluster'] = kmeans.fit_predict(rfm_scaled)
+
+    # Identify high‑risk cluster: lowest average monetary and frequency
+    cluster_stats = rfm.groupby('cluster')[['monetary', 'frequency']].mean()
+    # The cluster with the smallest sum of normalized scores is the high‑risk
+    cluster_stats['score'] = cluster_stats['monetary'] + cluster_stats['frequency']
+    high_risk_cluster = cluster_stats['score'].idxmin()
+    
+    rfm['is_high_risk'] = (rfm['cluster'] == high_risk_cluster).astype(int)
+    return rfm[['CustomerId', 'is_high_risk']]
 
 def build_preprocessing_pipeline():
-    """
-    Returns a Pipeline that:
-    - Applies custom feature engineering (FeatureEngineer)
-    - Imputes missing values (median for numeric)
-    - Standardises numeric features
-    """
     pipeline = Pipeline(steps=[
         ('feature_engineer', FeatureEngineer()),
         ('imputer', SimpleImputer(strategy='median')),
@@ -88,18 +89,49 @@ def build_preprocessing_pipeline():
     ])
     return pipeline
 
-# Optional: a wrapper that fits and transforms and saves processed data
-def process_and_save(raw_path='data/raw/Xente.csv', output_path='data/processed/features.csv'):
+def process_and_save(raw_path='data/raw/Xente.csv',
+                     output_features='data/processed/features.csv',
+                     output_target='data/processed/target.csv',
+                     output_final='data/processed/model_data.csv'):
     df = load_raw_data(raw_path)
+    
+    # Compute target
+    target_df = compute_rfm_and_target(df)
+    target_df.to_csv(output_target, index=False)
+    
+    # Compute features
     pipeline = build_preprocessing_pipeline()
-    X_processed = pipeline.fit_transform(df)
-    # X_processed is a numpy array; we need column names from the pipeline
-    # We'll retrieve feature names from the last step that has them.
-    # For simplicity, we'll convert back to DataFrame with generic column names
-    # but later we'll save the pipeline to keep consistent.
-    pd.DataFrame(X_processed).to_csv(output_path, index=False)
-    print(f"Processed features saved to {output_path}")
-    return pipeline
+    X_with_cust = pipeline.named_steps['feature_engineer'].fit_transform(df)
+    # Remove CustomerId before imputation/scaling
+    customer_ids = X_with_cust['CustomerId']
+    X_numeric = X_with_cust.drop(columns=['CustomerId'])
+    
+    # Apply imputer and scaler manually (since pipeline expects full array)
+    # Actually, we can adjust pipeline to work with DataFrame, but easier:
+    # We'll build a new pipeline without the FeatureEngineer for final steps
+    # Better: we'll modify the pipeline to keep CustomerId aside
+    # Here we'll just do it stepwise for clarity
+    imputer = SimpleImputer(strategy='median')
+    scaler = StandardScaler()
+    X_imputed = imputer.fit_transform(X_numeric)
+    X_scaled = scaler.fit_transform(X_imputed)
+    
+    # Convert back to DataFrame with column names
+    feature_names = X_numeric.columns.tolist()
+    X_processed = pd.DataFrame(X_scaled, columns=feature_names)
+    X_processed.insert(0, 'CustomerId', customer_ids)
+    
+    # Save features
+    X_processed.to_csv(output_features, index=False)
+    
+    # Merge with target
+    final_df = X_processed.merge(target_df, on='CustomerId', how='inner')
+    final_df.to_csv(output_final, index=False)
+    print(f"Final dataset with target saved to {output_final}")
+    return final_df
+
+def load_raw_data(path='data/raw/Xente.csv'):
+    return pd.read_csv(path)
 
 if __name__ == '__main__':
-    pipeline = process_and_save()
+    process_and_save()
